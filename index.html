@@ -1,24 +1,27 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Secret Frontend Demo</title>
+
+    <title>Secret Frontend</title>
 
     <style>
         body {
-            font-family: sans-serif;
+            font-family: system-ui, sans-serif;
             max-width: 700px;
-            margin: 60px auto;
+            margin: 80px auto;
+            padding: 20px;
         }
 
         button {
             padding: 10px 16px;
+            margin-right: 8px;
             cursor: pointer;
         }
 
-        #status {
-            margin-top: 20px;
+        #counter {
+            font-size: 2rem;
         }
     </style>
 </head>
@@ -29,6 +32,8 @@
 
     <p id="counter">Count: 0</p>
 
+    <p id="message">Waiting...</p>
+
     <button id="increment">
         Increment
     </button>
@@ -37,13 +42,11 @@
         Change message
     </button>
 
-    <p id="status">
-        Waiting...
-    </p>
-
-
     <!--
-        THIS IS THE CODE THAT SHOULD EVENTUALLY BE SECRET.
+        This JavaScript is NEVER sent to the browser.
+
+        The Worker removes this entire <script> element
+        before returning the page.
     -->
 
     <script>
@@ -56,11 +59,14 @@
 
                 count++;
 
-                document.getElementById("counter")
-                    .textContent = "Count: " + count;
+                document
+                    .getElementById("counter")
+                    .textContent = `Count: ${count}`;
 
-                document.getElementById("status")
-                    .textContent = "You clicked it " + count + " times.";
+                document
+                    .getElementById("message")
+                    .textContent =
+                        `Clicked ${count} times.`;
 
             });
 
@@ -69,8 +75,10 @@
             .getElementById("change")
             .addEventListener("click", () => {
 
-                document.getElementById("status")
-                    .textContent = "The secret frontend JS ran!";
+                document
+                    .getElementById("message")
+                    .textContent =
+                        "This was changed by the application JavaScript.";
 
             });
 
