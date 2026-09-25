@@ -16,7 +16,7 @@
 
         button {
             padding: 10px 16px;
-            margin-right: 8px;
+            margin: 5px;
             cursor: pointer;
         }
 
@@ -42,11 +42,11 @@
         Change message
     </button>
 
-    <!--
-        This JavaScript is NEVER sent to the browser.
 
-        The Worker removes this entire <script> element
-        before returning the page.
+    <!--
+        Everything inside this script is SECRET.
+
+        The Worker extracts it before serving this page.
     -->
 
     <script>
@@ -67,7 +67,6 @@
                     .getElementById("message")
                     .textContent =
                         `Clicked ${count} times.`;
-
             });
 
 
@@ -78,8 +77,7 @@
                 document
                     .getElementById("message")
                     .textContent =
-                        "This was changed by the application JavaScript.";
-
+                        "The secret frontend JS ran.";
             });
 
     </script>
