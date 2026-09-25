@@ -1,107 +1,368 @@
-/**
- * Minimal server-driven frontend prototype for Cloudflare Workers.
- *
- * index.html is treated as the initial document. Application state and
- * event handlers live on the Worker. The browser receives only HTML and
- * mutation patches.
- */
-
 export default {
-  async fetch(request, env) {
-    const url = new URL(request.url);
 
-    if (request.method === "GET" && url.pathname === "/") {
-      return new Response(INDEX_HTML, {
-        headers: { "content-type": "text/html; charset=UTF-8" },
-      });
+    async fetch(request, env) {
+
+        const url = new URL(request.url);
+
+
+        // -----------------------------------------
+        // Initial page request
+        // -----------------------------------------
+
+        if (
+            request.method === "GET" &&
+            url.pathname === "/"
+        ) {
+
+            const html = INDEX_HTML;
+
+            return new Response(
+                createClientPage(html),
+                {
+                    headers: {
+                        "Content-Type": "text/html; charset=UTF-8"
+                    }
+                }
+            );
+        }
+
+
+        // -----------------------------------------
+        // Browser → Worker events
+        // -----------------------------------------
+
+        if (
+            request.method === "POST" &&
+            url.pathname === "/__event"
+        ) {
+
+            const data = await request.json();
+
+            const currentHTML = data.html;
+            const action = data.action;
+
+
+            /*
+             * At this point:
+             *
+             * currentHTML = the browser's current page
+             * action       = what the user did
+             *
+             * Your real server-side frontend engine
+             * would execute the original JS here.
+             */
+
+
+            const updatedHTML = await runApplication(
+                currentHTML,
+                action
+            );
+
+
+            return new Response(
+                JSON.stringify({
+                    html: updatedHTML
+                }),
+                {
+                    headers: {
+                        "Content-Type": "application/json"
+                    }
+                }
+            );
+        }
+
+
+        return new Response("Not found", {
+            status: 404
+        });
     }
-
-    if (request.method === "POST" && url.pathname === "/_secret/event") {
-      return handleEvent(request);
-    }
-
-    return new Response("Not found", { status: 404 });
-  },
 };
 
-// In a real implementation this would be loaded from index.html at build time.
-const INDEX_HTML = `<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Secret Frontend Demo</title>
-</head>
-<body>
-  <main id="app">
-    <h1 id="title">Hello</h1>
-    <p id="count">0</p>
-    <button id="increment">Increment</button>
-  </main>
-  <script>
-    (() => {
-      const send = async (event) => {
-        const response = await fetch('/_secret/event', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify(event)
+
+/* =================================================
+   INITIAL PAGE PROCESSING
+   ================================================= */
+
+function createClientPage(html) {
+
+    /*
+     * Remove ALL application scripts.
+     */
+
+    html = stripScripts(html);
+
+
+    /*
+     * Inject the tiny public communication runtime.
+     */
+
+    const clientScript = `
+<script>
+(() => {
+
+    async function sendAction(action) {
+
+        const response = await fetch("/__event", {
+
+            method: "POST",
+
+            headers: {
+                "Content-Type": "application/json"
+            },
+
+            body: JSON.stringify({
+
+                action: action,
+
+                html: document.documentElement.outerHTML
+
+            })
+
         });
 
-        if (!response.ok) return;
 
-        const message = await response.json();
-        applyPatches(message.patches || []);
-      };
+        const result = await response.json();
 
-      const applyPatches = (patches) => {
-        for (const patch of patches) {
-          const node = document.querySelector(`[data-secret-id="${CSS.escape(patch.id)}"]`);
-          if (!node) continue;
 
-          if (patch.type === 'text') node.textContent = patch.value;
-          if (patch.type === 'html') node.innerHTML = patch.value;
-          if (patch.type === 'attribute') {
-            if (patch.value == null) node.removeAttribute(patch.name);
-            else node.setAttribute(patch.name, patch.value);
-          }
-          if (patch.type === 'property') node[patch.name] = patch.value;
-          if (patch.type === 'remove') node.remove();
-        }
-      };
+        /*
+         * Replace the current page with
+         * the HTML generated by the Worker.
+         */
 
-      // Event delegation means the client does not need application handlers.
-      document.addEventListener('click', (event) => {
-        const target = event.target.closest('[data-secret-id]');
-        if (!target) return;
+        document.open();
 
-        send({
-          type: 'click',
-          target: target.dataset.secretId
+        document.write(result.html);
+
+        document.close();
+
+    }
+
+
+    /*
+     * Capture clicks.
+     */
+
+    document.addEventListener("click", event => {
+
+        const element =
+            event.target.closest("[id]");
+
+        if (!element)
+            return;
+
+
+        sendAction({
+
+            type: "click",
+
+            id: element.id
+
         });
-      });
-    })();
-  </script>
-</body>
-</html>`;
 
-async function handleEvent(request) {
-  const event = await request.json();
+    });
 
-  // Demo state only. Durable Objects should be used for real per-user state.
-  if (event.type !== "click" || event.target !== "increment") {
-    return Response.json({ patches: [] });
-  }
+})();
+</script>
+`;
 
-  // Replace this with your server-side DOM/state engine.
-  const count = 1;
 
-  return Response.json({
-    patches: [
-      {
-        type: "text",
-        id: "count",
-        value: String(count),
-      },
-    ],
-  });
+    /*
+     * Put our runtime immediately before </body>.
+     */
+
+    return html.replace(
+        "</body>",
+        clientScript + "</body>"
+    );
 }
+
+
+/* =================================================
+   REMOVE APPLICATION JAVASCRIPT
+   ================================================= */
+
+function stripScripts(html) {
+
+    return html.replace(
+        /<script\b[^>]*>[\s\S]*?<\/script>/gi,
+        ""
+    );
+
+}
+
+
+/* =================================================
+   APPLICATION ENGINE
+   ================================================= */
+
+async function runApplication(html, action) {
+
+    /*
+     * THIS is where the interesting part eventually goes.
+     *
+     * For now we're just demonstrating that the Worker
+     * can modify the HTML.
+     */
+
+
+    if (
+        action.type === "click" &&
+        action.id === "increment"
+    ) {
+
+        html = modifyCounter(html);
+
+    }
+
+
+    if (
+        action.type === "click" &&
+        action.id === "change"
+    ) {
+
+        html = html.replace(
+            "Waiting...",
+            "The Worker changed this!"
+        );
+
+    }
+
+
+    /*
+     * Make sure application scripts remain stripped.
+     */
+
+    return stripScripts(html);
+}
+
+
+/* =================================================
+   DEMO HTML MODIFICATION
+   ================================================= */
+
+function modifyCounter(html) {
+
+    const match = html.match(
+        /<p id="counter">Count: (\d+)<\/p>/
+    );
+
+
+    if (!match)
+        return html;
+
+
+    const oldCount =
+        Number(match[1]);
+
+
+    const newCount =
+        oldCount + 1;
+
+
+    return html.replace(
+        match[0],
+
+        `<p id="counter">Count: ${newCount}</p>`
+    );
+
+}
+
+
+/* =================================================
+   YOUR INDEX.HTML
+   ================================================= */
+
+const INDEX_HTML = `
+
+<!DOCTYPE html>
+
+<html>
+
+<head>
+
+    <meta charset="UTF-8">
+
+    <meta
+        name="viewport"
+        content="width=device-width, initial-scale=1.0"
+    >
+
+    <title>Secret Frontend Demo</title>
+
+    <style>
+
+        body {
+            font-family: sans-serif;
+            max-width: 700px;
+            margin: 60px auto;
+        }
+
+        button {
+            padding: 10px 16px;
+            cursor: pointer;
+        }
+
+        #status {
+            margin-top: 20px;
+        }
+
+    </style>
+
+</head>
+
+<body>
+
+    <h1>Secret Frontend</h1>
+
+    <p id="counter">Count: 0</p>
+
+    <button id="increment">
+        Increment
+    </button>
+
+    <button id="change">
+        Change message
+    </button>
+
+    <p id="status">
+        Waiting...
+    </p>
+
+
+    <script>
+
+        let count = 0;
+
+        document
+            .getElementById("increment")
+            .addEventListener("click", () => {
+
+                count++;
+
+                document.getElementById("counter")
+                    .textContent = "Count: " + count;
+
+                document.getElementById("status")
+                    .textContent =
+                        "You clicked it " + count + " times.";
+
+            });
+
+
+        document
+            .getElementById("change")
+            .addEventListener("click", () => {
+
+                document.getElementById("status")
+                    .textContent =
+                        "The secret frontend JS ran!";
+
+            });
+
+    </script>
+
+</body>
+
+</html>
+
+`;
