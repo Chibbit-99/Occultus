@@ -5,128 +5,255 @@ export default {
         const url = new URL(request.url);
 
 
-        // -----------------------------------------
-        // Initial page request
-        // -----------------------------------------
+        // ----------------------------------------
+        // Initial page
+        // ----------------------------------------
 
         if (
             request.method === "GET" &&
             url.pathname === "/"
         ) {
 
-            const html = INDEX_HTML;
+            const source = await getIndexHTML(
+                request,
+                env
+            );
+
+            if (!source) {
+                return new Response(
+                    "index.html not found",
+                    { status: 500 }
+                );
+            }
+
+
+            // Remove application JavaScript.
+
+            const publicHTML =
+                stripScripts(source);
+
+
+            // Inject the communication runtime.
+
+            const finalHTML =
+                injectClientRuntime(publicHTML);
+
 
             return new Response(
-                createClientPage(html),
+                finalHTML,
                 {
                     headers: {
-                        "Content-Type": "text/html; charset=UTF-8"
+                        "Content-Type":
+                            "text/html; charset=UTF-8"
                     }
                 }
             );
         }
 
 
-        // -----------------------------------------
-        // Browser → Worker events
-        // -----------------------------------------
+        // ----------------------------------------
+        // Browser → Worker
+        // ----------------------------------------
 
         if (
             request.method === "POST" &&
             url.pathname === "/__event"
         ) {
 
-            const data = await request.json();
+            let data;
 
-            const currentHTML = data.html;
-            const action = data.action;
+            try {
 
+                data = await request.json();
 
-            /*
-             * At this point:
-             *
-             * currentHTML = the browser's current page
-             * action       = what the user did
-             *
-             * Your real server-side frontend engine
-             * would execute the original JS here.
-             */
+            } catch {
 
-
-            const updatedHTML = await runApplication(
-                currentHTML,
-                action
-            );
-
-
-            return new Response(
-                JSON.stringify({
-                    html: updatedHTML
-                }),
-                {
-                    headers: {
-                        "Content-Type": "application/json"
+                return Response.json(
+                    {
+                        error: "Invalid JSON"
+                    },
+                    {
+                        status: 400
                     }
-                }
-            );
+                );
+            }
+
+
+            if (
+                typeof data.html !== "string" ||
+                !data.action
+            ) {
+
+                return Response.json(
+                    {
+                        error:
+                            "Expected html and action"
+                    },
+                    {
+                        status: 400
+                    }
+                );
+            }
+
+
+            const updatedHTML =
+                await handleEvent(
+                    data.html,
+                    data.action
+                );
+
+
+            return Response.json({
+                html:
+                    injectClientRuntime(
+                        stripScripts(updatedHTML)
+                    )
+            });
         }
 
 
-        return new Response("Not found", {
-            status: 404
-        });
+        return new Response(
+            "Not found",
+            {
+                status: 404
+            }
+        );
     }
 };
 
 
-/* =================================================
-   INITIAL PAGE PROCESSING
-   ================================================= */
+/* =========================================================
+   GET index.html
+   ========================================================= */
 
-function createClientPage(html) {
-
-    /*
-     * Remove ALL application scripts.
-     */
-
-    html = stripScripts(html);
-
+async function getIndexHTML(request, env) {
 
     /*
-     * Inject the tiny public communication runtime.
+     * Cloudflare's Static Assets binding serves
+     * the actual index.html file.
+     *
+     * Nothing from index.html is hardcoded here.
      */
 
-    const clientScript = `
+    const url =
+        new URL("/index.html", request.url);
+
+
+    const response =
+        await env.ASSETS.fetch(
+            new Request(url)
+        );
+
+
+    if (!response.ok) {
+        return null;
+    }
+
+
+    return await response.text();
+}
+
+
+/* =========================================================
+   REMOVE SCRIPTS
+   ========================================================= */
+
+function stripScripts(html) {
+
+    /*
+     * Removes:
+
+        <script>
+            ...
+        </script>
+
+     * and:
+
+        <script src="...">
+            ...
+        </script>
+    */
+
+    return html.replace(
+        /<script\b[^>]*>[\s\S]*?<\/script\s*>/gi,
+        ""
+    );
+}
+
+
+/* =========================================================
+   INJECT PUBLIC CLIENT RUNTIME
+   ========================================================= */
+
+function injectClientRuntime(html) {
+
+    const runtime = `
+
 <script>
 (() => {
 
+    /*
+     * This is the ONLY application-related JavaScript
+     * the browser receives.
+     *
+     * It does not contain the application's logic.
+     */
+
+
     async function sendAction(action) {
 
-        const response = await fetch("/__event", {
+        /*
+         * Capture the current state of the page.
+         */
 
-            method: "POST",
-
-            headers: {
-                "Content-Type": "application/json"
-            },
-
-            body: JSON.stringify({
-
-                action: action,
-
-                html: document.documentElement.outerHTML
-
-            })
-
-        });
+        const currentHTML =
+            document.documentElement.outerHTML;
 
 
-        const result = await response.json();
+        const response =
+            await fetch("/__event", {
+
+                method: "POST",
+
+                headers: {
+                    "Content-Type":
+                        "application/json"
+                },
+
+                body: JSON.stringify({
+
+                    html: currentHTML,
+
+                    action: action
+
+                })
+
+            });
+
+
+        if (!response.ok) {
+
+            console.error(
+                "Frontend Worker error:",
+                await response.text()
+            );
+
+            return;
+        }
+
+
+        const result =
+            await response.json();
+
+
+        if (!result.html) {
+            return;
+        }
 
 
         /*
-         * Replace the current page with
-         * the HTML generated by the Worker.
+         * Replace the current document with
+         * the Worker-generated document.
          */
 
         document.open();
@@ -142,66 +269,71 @@ function createClientPage(html) {
      * Capture clicks.
      */
 
-    document.addEventListener("click", event => {
+    document.addEventListener(
+        "click",
+        event => {
 
-        const element =
-            event.target.closest("[id]");
-
-        if (!element)
-            return;
+            const element =
+                event.target.closest("[id]");
 
 
-        sendAction({
+            if (!element) {
+                return;
+            }
 
-            type: "click",
 
-            id: element.id
+            sendAction({
 
-        });
+                type: "click",
 
-    });
+                id: element.id
+
+            });
+
+        }
+    );
 
 })();
 </script>
+
 `;
 
 
     /*
-     * Put our runtime immediately before </body>.
+     * Insert the runtime immediately before
+     * </body>.
      */
 
-    return html.replace(
-        "</body>",
-        clientScript + "</body>"
-    );
-}
+    if (html.includes("</body>")) {
 
+        return html.replace(
+            /<\/body>/i,
+            runtime + "</body>"
+        );
 
-/* =================================================
-   REMOVE APPLICATION JAVASCRIPT
-   ================================================= */
+    }
 
-function stripScripts(html) {
-
-    return html.replace(
-        /<script\b[^>]*>[\s\S]*?<\/script>/gi,
-        ""
-    );
-
-}
-
-
-/* =================================================
-   APPLICATION ENGINE
-   ================================================= */
-
-async function runApplication(html, action) {
 
     /*
-     * THIS is where the interesting part eventually goes.
+     * Handle HTML documents without <body>.
+     */
+
+    return html + runtime;
+}
+
+
+/* =========================================================
+   APPLICATION EXECUTION
+   ========================================================= */
+
+async function handleEvent(html, action) {
+
+    /*
+     * THIS is where the secret frontend runtime
+     * will eventually execute the original JS.
      *
-     * For now we're just demonstrating that the Worker
-     * can modify the HTML.
+     * For this first version, we're demonstrating
+     * the communication architecture.
      */
 
 
@@ -210,7 +342,7 @@ async function runApplication(html, action) {
         action.id === "increment"
     ) {
 
-        html = modifyCounter(html);
+        html = incrementCounter(html);
 
     }
 
@@ -221,148 +353,41 @@ async function runApplication(html, action) {
     ) {
 
         html = html.replace(
-            "Waiting...",
-            "The Worker changed this!"
+            /<p id="message">[\s\S]*?<\/p>/i,
+            `<p id="message">Changed by the Worker.</p>`
         );
 
     }
 
 
-    /*
-     * Make sure application scripts remain stripped.
-     */
-
-    return stripScripts(html);
+    return html;
 }
 
 
-/* =================================================
-   DEMO HTML MODIFICATION
-   ================================================= */
+/* =========================================================
+   DEMO DOM MANIPULATION
+   ========================================================= */
 
-function modifyCounter(html) {
+function incrementCounter(html) {
 
-    const match = html.match(
-        /<p id="counter">Count: (\d+)<\/p>/
-    );
+    const match =
+        html.match(
+            /<p id="counter">Count:\s*(\d+)<\/p>/i
+        );
 
 
-    if (!match)
+    if (!match) {
         return html;
+    }
 
 
-    const oldCount =
-        Number(match[1]);
-
-
-    const newCount =
-        oldCount + 1;
+    const count =
+        Number(match[1]) + 1;
 
 
     return html.replace(
         match[0],
 
-        `<p id="counter">Count: ${newCount}</p>`
+        `<p id="counter">Count: ${count}</p>`
     );
-
 }
-
-
-/* =================================================
-   YOUR INDEX.HTML
-   ================================================= */
-
-const INDEX_HTML = `
-
-<!DOCTYPE html>
-
-<html>
-
-<head>
-
-    <meta charset="UTF-8">
-
-    <meta
-        name="viewport"
-        content="width=device-width, initial-scale=1.0"
-    >
-
-    <title>Secret Frontend Demo</title>
-
-    <style>
-
-        body {
-            font-family: sans-serif;
-            max-width: 700px;
-            margin: 60px auto;
-        }
-
-        button {
-            padding: 10px 16px;
-            cursor: pointer;
-        }
-
-        #status {
-            margin-top: 20px;
-        }
-
-    </style>
-
-</head>
-
-<body>
-
-    <h1>Secret Frontend</h1>
-
-    <p id="counter">Count: 0</p>
-
-    <button id="increment">
-        Increment
-    </button>
-
-    <button id="change">
-        Change message
-    </button>
-
-    <p id="status">
-        Waiting...
-    </p>
-
-
-    <script>
-
-        let count = 0;
-
-        document
-            .getElementById("increment")
-            .addEventListener("click", () => {
-
-                count++;
-
-                document.getElementById("counter")
-                    .textContent = "Count: " + count;
-
-                document.getElementById("status")
-                    .textContent =
-                        "You clicked it " + count + " times.";
-
-            });
-
-
-        document
-            .getElementById("change")
-            .addEventListener("click", () => {
-
-                document.getElementById("status")
-                    .textContent =
-                        "The secret frontend JS ran!";
-
-            });
-
-    </script>
-
-</body>
-
-</html>
-
-`;
