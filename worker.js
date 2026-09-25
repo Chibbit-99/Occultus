@@ -1,3 +1,35 @@
+/*
+ * OCCULTUS
+ *
+ * source.html
+ *     ↓
+ * Worker
+ *     ↓
+ * extract application JS
+ *     ↓
+ * remove application JS
+ *     ↓
+ * inject communication runtime
+ *     ↓
+ * browser
+ *
+ *
+ * Browser interaction:
+ *
+ * browser
+ *     ↓
+ * current HTML + action
+ *     ↓
+ * Worker
+ *     ↓
+ * server-side application
+ *     ↓
+ * new HTML
+ *     ↓
+ * browser
+ */
+
+
 export default {
 
     async fetch(request, env) {
@@ -6,9 +38,9 @@ export default {
 
 
         /*
-         * =====================================================
-         * INITIAL PAGE
-         * =====================================================
+         * ==================================================
+         * ROOT PAGE
+         * ==================================================
          */
 
         if (
@@ -16,123 +48,42 @@ export default {
             url.pathname === "/"
         ) {
 
-            const source =
-                await loadIndex(env);
-
-
-            /*
-             * Extract the application's JavaScript.
-             */
-
-            const scripts =
-                extractScripts(source);
-
-
-            /*
-             * Remove application JavaScript.
-             */
-
-            let html =
-                removeScripts(source);
-
-
-            /*
-             * Add ONLY the communication runtime.
-             */
-
-            html =
-                injectRuntime(html);
-
-
-            /*
-             * Store the secret application somewhere
-             * associated with this session in the real
-             * implementation.
-             *
-             * For this basic prototype we're keeping it
-             * in memory.
-             */
-
-            applications.set(
-                getSession(request),
-                scripts
-            );
-
-
-            return htmlResponse(html);
+            return serveApplication(env);
         }
 
 
         /*
-         * =====================================================
-         * EVENT FROM BROWSER
-         * =====================================================
+         * ==================================================
+         * EVENT
+         * ==================================================
          */
 
         if (
             request.method === "POST" &&
-            url.pathname === "/__event"
+            url.pathname === "/__occultus_event"
         ) {
 
-            const data =
-                await request.json();
+            return handleEvent(
+                request,
+                env
+            );
+        }
 
 
-            const session =
-                getSession(request);
+        /*
+         * Never expose source.html directly.
+         */
 
+        if (
+            url.pathname === "/source.html"
+        ) {
 
-            const scripts =
-                applications.get(session);
-
-
-            if (!scripts) {
-
-                return new Response(
-                    "Session expired",
-                    {
-                        status: 400
-                    }
-                );
-            }
-
-
-            /*
-             * Browser gives us:
-             *
-             *     current HTML
-             *     action
-             *
-             * The application JS is still only on
-             * the Worker.
-             */
-
-            const result =
-                await executeApplication(
-                    scripts,
-                    data.html,
-                    data.action
-                );
-
-
-            /*
-             * Make absolutely sure application
-             * scripts never get returned.
-             */
-
-            let html =
-                removeScripts(result);
-
-
-            /*
-             * Add the tiny communication runtime again.
-             */
-
-            html =
-                injectRuntime(html);
-
-
-            return htmlResponse(html);
+            return new Response(
+                "Not found",
+                {
+                    status: 404
+                }
+            );
         }
 
 
@@ -147,54 +98,213 @@ export default {
 
 
 /*
- * =========================================================
- * TEMPORARY APPLICATION STORAGE
- * =========================================================
- *
- * This is only for the prototype.
- *
- * A real version should use Durable Objects so every
- * browser session has persistent application state.
+ * ==========================================================
+ * SERVE APPLICATION
+ * ==========================================================
  */
 
-const applications = new Map();
+async function serveApplication(env) {
 
-
-/*
- * =========================================================
- * LOAD INDEX.HTML
- * =========================================================
- */
-
-async function loadIndex(env) {
+    /*
+     * Read source.html from the Cloudflare Assets
+     * system.
+     */
 
     const response =
         await env.ASSETS.fetch(
             new Request(
-                "https://internal/index.html"
+                "https://occultus.internal/source.html"
             )
         );
 
 
     if (!response.ok) {
 
-        throw new Error(
-            "Could not load index.html"
+        return new Response(
+            "source.html could not be found.",
+            {
+                status: 500
+            }
         );
     }
 
 
-    return await response.text();
+    const source =
+        await response.text();
+
+
+    /*
+     * Extract the actual application JavaScript.
+     *
+     * This remains on the Worker.
+     */
+
+    const application =
+        extractApplication(source);
+
+
+    /*
+     * Remove the application JavaScript
+     * from the HTML.
+     */
+
+    let html =
+        removeScripts(source);
+
+
+    /*
+     * Inject ONLY the communication runtime.
+     */
+
+    html =
+        injectRuntime(html);
+
+
+    return htmlResponse(html);
 }
 
 
 /*
- * =========================================================
- * EXTRACT SCRIPTS
- * =========================================================
+ * ==========================================================
+ * HANDLE EVENT
+ * ==========================================================
  */
 
-function extractScripts(html) {
+async function handleEvent(request, env) {
+
+    let data;
+
+
+    try {
+
+        data =
+            await request.json();
+
+    } catch {
+
+        return Response.json(
+            {
+                error: "Invalid request."
+            },
+            {
+                status: 400
+            }
+        );
+    }
+
+
+    /*
+     * Expected:
+     *
+     * {
+     *     html: "...",
+     *
+     *     action: {
+     *         type: "click",
+     *         target: "increment"
+     *     }
+     * }
+     */
+
+    if (
+        typeof data.html !== "string" ||
+        !data.action
+    ) {
+
+        return Response.json(
+            {
+                error:
+                    "Missing html or action."
+            },
+            {
+                status: 400
+            }
+        );
+    }
+
+
+    /*
+     * Load the original source again.
+     *
+     * The application JS comes from the Worker-side
+     * source, NOT from the HTML supplied by the client.
+     */
+
+    const sourceResponse =
+        await env.ASSETS.fetch(
+            new Request(
+                "https://occultus.internal/source.html"
+            )
+        );
+
+
+    if (!sourceResponse.ok) {
+
+        return Response.json(
+            {
+                error:
+                    "Application source unavailable."
+            },
+            {
+                status: 500
+            }
+        );
+    }
+
+
+    const source =
+        await sourceResponse.text();
+
+
+    const application =
+        extractApplication(source);
+
+
+    /*
+     * Execute the application against the current
+     * page.
+     *
+     * This is currently our server-side DOM layer.
+     */
+
+    const updated =
+        await executeApplication(
+            data.html,
+            data.action,
+            application
+        );
+
+
+    /*
+     * NEVER allow application scripts into the
+     * response.
+     */
+
+    let html =
+        removeScripts(updated);
+
+
+    /*
+     * Add the communication runtime back.
+     */
+
+    html =
+        injectRuntime(html);
+
+
+    return Response.json({
+        html
+    });
+}
+
+
+/*
+ * ==========================================================
+ * EXTRACT APPLICATION SCRIPTS
+ * ==========================================================
+ */
+
+function extractApplication(html) {
 
     const scripts = [];
 
@@ -211,9 +321,11 @@ function extractScripts(html) {
 
         scripts.push({
 
-            attributes: match[1],
+            attributes:
+                match[1],
 
-            code: match[2]
+            code:
+                match[2]
 
         });
     }
@@ -224,9 +336,9 @@ function extractScripts(html) {
 
 
 /*
- * =========================================================
+ * ==========================================================
  * REMOVE SCRIPTS
- * =========================================================
+ * ==========================================================
  */
 
 function removeScripts(html) {
@@ -239,27 +351,23 @@ function removeScripts(html) {
 
 
 /*
- * =========================================================
+ * ==========================================================
  * CLIENT COMMUNICATION RUNTIME
- * =========================================================
+ * ==========================================================
  *
- * THIS IS THE ONLY JAVASCRIPT THE BROWSER RECEIVES.
+ * THIS IS THE ONLY JAVASCRIPT SENT TO THE BROWSER.
  *
  * It contains no application logic.
- * It does not know what "increment" means.
- * It does not know what your application does.
  *
- * Its only purpose is:
+ * It only:
  *
- *     event
- *       ↓
- *     send HTML + event
- *       ↓
- *     receive HTML
- *       ↓
- *     replace document
+ *     1. Detects an interaction.
+ *     2. Gets the current HTML.
+ *     3. Sends HTML + action to Worker.
+ *     4. Receives HTML.
+ *     5. Replaces the document.
  *
- * =========================================================
+ * ==========================================================
  */
 
 function injectRuntime(html) {
@@ -268,18 +376,11 @@ function injectRuntime(html) {
 <script>
 (() => {
 
-    document.addEventListener("click", async (event) => {
+    async function send(action) {
 
-        const target =
-            event.target.closest("[id]");
-
-        if (!target)
-            return;
-
-
-        const response =
-            await fetch("/__event", {
-
+        const response = await fetch(
+            "/__occultus_event",
+            {
                 method: "POST",
 
                 headers: {
@@ -290,25 +391,21 @@ function injectRuntime(html) {
                 body: JSON.stringify({
 
                     html:
-                        document.documentElement
+                        document
+                            .documentElement
                             .outerHTML,
 
-                    action: {
-
-                        type: "click",
-
-                        target: target.id
-
-                    }
+                    action
 
                 })
-
-            });
+            }
+        );
 
 
         if (!response.ok) {
 
             console.error(
+                "Occultus request failed:",
                 await response.text()
             );
 
@@ -320,24 +417,64 @@ function injectRuntime(html) {
             await response.json();
 
 
+        if (
+            !result.html
+        ) {
+            return;
+        }
+
+
         document.open();
 
-        document.write(result.html);
+        document.write(
+            result.html
+        );
 
         document.close();
 
-    });
+    }
+
+
+    /*
+     * Capture clicks.
+     *
+     * The runtime does not know what the click
+     * actually means.
+     */
+
+    document.addEventListener(
+        "click",
+        event => {
+
+            const element =
+                event.target.closest("[id]");
+
+
+            if (!element) {
+                return;
+            }
+
+
+            send({
+
+                type: "click",
+
+                target:
+                    element.id
+
+            });
+
+        }
+    );
 
 })();
 </script>
 `;
 
 
-    /*
-     * Put it immediately before </body>.
-     */
-
-    if (/<\/body>/i.test(html)) {
+    if (
+        /<\/body>/i.test(html)
+    ) {
 
         return html.replace(
             /<\/body>/i,
@@ -351,40 +488,40 @@ function injectRuntime(html) {
 
 
 /*
- * =========================================================
- * EXECUTE APPLICATION
- * =========================================================
+ * ==========================================================
+ * SERVER-SIDE APPLICATION
+ * ==========================================================
+ *
+ * TEMPORARY IMPLEMENTATION
+ *
+ * This demonstrates the protocol.
+ *
+ * The next stage replaces this with an actual
+ * server-side DOM implementation and executes
+ * the extracted application JavaScript.
+ *
+ * ==========================================================
  */
 
 async function executeApplication(
-    scripts,
     html,
-    action
+    action,
+    application
 ) {
 
     /*
-     * -----------------------------------------------------
-     * THIS IS CURRENTLY THE PLACEHOLDER.
-     * -----------------------------------------------------
+     * IMPORTANT:
      *
-     * The next layer is our server-side DOM:
+     * `application` contains the secret JS extracted
+     * from source.html.
      *
-     *     document
-     *     Element
-     *     Node
-     *     querySelector()
-     *     getElementById()
-     *     textContent
-     *     innerHTML
-     *     classList
-     *     appendChild()
-     *     remove()
-     *     etc.
-     *
-     * Then the extracted script is executed against
-     * that environment.
+     * It is NEVER sent back to the browser.
      */
 
+
+    /*
+     * Demo: increment
+     */
 
     if (
         action.type === "click" &&
@@ -392,9 +529,13 @@ async function executeApplication(
     ) {
 
         html =
-            incrementCounter(html);
+            updateCounter(html);
     }
 
+
+    /*
+     * Demo: change message
+     */
 
     if (
         action.type === "click" &&
@@ -406,7 +547,7 @@ async function executeApplication(
                 /<p id="message">[\s\S]*?<\/p>/i,
 
                 `<p id="message">
-                    The secret frontend JS ran.
+                    This was changed by secret JS.
                 </p>`
             );
     }
@@ -417,12 +558,12 @@ async function executeApplication(
 
 
 /*
- * =========================================================
- * DEMO DOM CHANGE
- * =========================================================
+ * ==========================================================
+ * DEMO COUNTER
+ * ==========================================================
  */
 
-function incrementCounter(html) {
+function updateCounter(html) {
 
     const match =
         html.match(
@@ -430,8 +571,9 @@ function incrementCounter(html) {
         );
 
 
-    if (!match)
+    if (!match) {
         return html;
+    }
 
 
     const count =
@@ -441,57 +583,17 @@ function incrementCounter(html) {
     return html.replace(
         match[0],
 
-        `<p id="counter">Count: ${count}</p>`
+        `<p id="counter">
+            Count: ${count}
+        </p>`
     );
 }
 
 
 /*
- * =========================================================
- * SESSION
- * =========================================================
- */
-
-function getSession(request) {
-
-    /*
-     * Temporary prototype session identifier.
-     *
-     * A production implementation should establish
-     * a real session cookie and persist state with a
-     * Durable Object.
-     */
-
-    const cookie =
-        request.headers.get("Cookie");
-
-
-    if (cookie) {
-
-        const match =
-            cookie.match(
-                /secret_session=([^;]+)/
-            );
-
-
-        if (match) {
-            return match[1];
-        }
-    }
-
-
-    /*
-     * Prototype fallback.
-     */
-
-    return "prototype";
-}
-
-
-/*
- * =========================================================
+ * ==========================================================
  * RESPONSE
- * =========================================================
+ * ==========================================================
  */
 
 function htmlResponse(html) {
@@ -501,7 +603,10 @@ function htmlResponse(html) {
         {
             headers: {
                 "Content-Type":
-                    "text/html; charset=UTF-8"
+                    "text/html; charset=UTF-8",
+
+                "Cache-Control":
+                    "no-store"
             }
         }
     );
