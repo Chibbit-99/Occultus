@@ -5,90 +5,91 @@ export default {
         const url = new URL(request.url);
 
 
-        // ----------------------------------------
-        // Initial page
-        // ----------------------------------------
+        /*
+         * =====================================================
+         * INITIAL PAGE
+         * =====================================================
+         */
 
         if (
             request.method === "GET" &&
             url.pathname === "/"
         ) {
 
-            const source = await getIndexHTML(
-                request,
-                env
+            const source =
+                await loadIndex(env);
+
+
+            /*
+             * Extract the application's JavaScript.
+             */
+
+            const scripts =
+                extractScripts(source);
+
+
+            /*
+             * Remove application JavaScript.
+             */
+
+            let html =
+                removeScripts(source);
+
+
+            /*
+             * Add ONLY the communication runtime.
+             */
+
+            html =
+                injectRuntime(html);
+
+
+            /*
+             * Store the secret application somewhere
+             * associated with this session in the real
+             * implementation.
+             *
+             * For this basic prototype we're keeping it
+             * in memory.
+             */
+
+            applications.set(
+                getSession(request),
+                scripts
             );
 
-            if (!source) {
-                return new Response(
-                    "index.html not found",
-                    { status: 500 }
-                );
-            }
 
-
-            // Remove application JavaScript.
-
-            const publicHTML =
-                stripScripts(source);
-
-
-            // Inject the communication runtime.
-
-            const finalHTML =
-                injectClientRuntime(publicHTML);
-
-
-            return new Response(
-                finalHTML,
-                {
-                    headers: {
-                        "Content-Type":
-                            "text/html; charset=UTF-8"
-                    }
-                }
-            );
+            return htmlResponse(html);
         }
 
 
-        // ----------------------------------------
-        // Browser → Worker
-        // ----------------------------------------
+        /*
+         * =====================================================
+         * EVENT FROM BROWSER
+         * =====================================================
+         */
 
         if (
             request.method === "POST" &&
             url.pathname === "/__event"
         ) {
 
-            let data;
-
-            try {
-
-                data = await request.json();
-
-            } catch {
-
-                return Response.json(
-                    {
-                        error: "Invalid JSON"
-                    },
-                    {
-                        status: 400
-                    }
-                );
-            }
+            const data =
+                await request.json();
 
 
-            if (
-                typeof data.html !== "string" ||
-                !data.action
-            ) {
+            const session =
+                getSession(request);
 
-                return Response.json(
-                    {
-                        error:
-                            "Expected html and action"
-                    },
+
+            const scripts =
+                applications.get(session);
+
+
+            if (!scripts) {
+
+                return new Response(
+                    "Session expired",
                     {
                         status: 400
                     }
@@ -96,19 +97,42 @@ export default {
             }
 
 
-            const updatedHTML =
-                await handleEvent(
+            /*
+             * Browser gives us:
+             *
+             *     current HTML
+             *     action
+             *
+             * The application JS is still only on
+             * the Worker.
+             */
+
+            const result =
+                await executeApplication(
+                    scripts,
                     data.html,
                     data.action
                 );
 
 
-            return Response.json({
-                html:
-                    injectClientRuntime(
-                        stripScripts(updatedHTML)
-                    )
-            });
+            /*
+             * Make absolutely sure application
+             * scripts never get returned.
+             */
+
+            let html =
+                removeScripts(result);
+
+
+            /*
+             * Add the tiny communication runtime again.
+             */
+
+            html =
+                injectRuntime(html);
+
+
+            return htmlResponse(html);
         }
 
 
@@ -122,31 +146,41 @@ export default {
 };
 
 
-/* =========================================================
-   GET index.html
-   ========================================================= */
+/*
+ * =========================================================
+ * TEMPORARY APPLICATION STORAGE
+ * =========================================================
+ *
+ * This is only for the prototype.
+ *
+ * A real version should use Durable Objects so every
+ * browser session has persistent application state.
+ */
 
-async function getIndexHTML(request, env) {
+const applications = new Map();
 
-    /*
-     * Cloudflare's Static Assets binding serves
-     * the actual index.html file.
-     *
-     * Nothing from index.html is hardcoded here.
-     */
 
-    const url =
-        new URL("/index.html", request.url);
+/*
+ * =========================================================
+ * LOAD INDEX.HTML
+ * =========================================================
+ */
 
+async function loadIndex(env) {
 
     const response =
         await env.ASSETS.fetch(
-            new Request(url)
+            new Request(
+                "https://internal/index.html"
+            )
         );
 
 
     if (!response.ok) {
-        return null;
+
+        throw new Error(
+            "Could not load index.html"
+        );
     }
 
 
@@ -154,25 +188,48 @@ async function getIndexHTML(request, env) {
 }
 
 
-/* =========================================================
-   REMOVE SCRIPTS
-   ========================================================= */
+/*
+ * =========================================================
+ * EXTRACT SCRIPTS
+ * =========================================================
+ */
 
-function stripScripts(html) {
+function extractScripts(html) {
 
-    /*
-     * Removes:
+    const scripts = [];
 
-        <script>
-            ...
-        </script>
+    const regex =
+        /<script\b([^>]*)>([\s\S]*?)<\/script\s*>/gi;
 
-     * and:
 
-        <script src="...">
-            ...
-        </script>
-    */
+    let match;
+
+
+    while (
+        (match = regex.exec(html)) !== null
+    ) {
+
+        scripts.push({
+
+            attributes: match[1],
+
+            code: match[2]
+
+        });
+    }
+
+
+    return scripts;
+}
+
+
+/*
+ * =========================================================
+ * REMOVE SCRIPTS
+ * =========================================================
+ */
+
+function removeScripts(html) {
 
     return html.replace(
         /<script\b[^>]*>[\s\S]*?<\/script\s*>/gi,
@@ -181,33 +238,43 @@ function stripScripts(html) {
 }
 
 
-/* =========================================================
-   INJECT PUBLIC CLIENT RUNTIME
-   ========================================================= */
+/*
+ * =========================================================
+ * CLIENT COMMUNICATION RUNTIME
+ * =========================================================
+ *
+ * THIS IS THE ONLY JAVASCRIPT THE BROWSER RECEIVES.
+ *
+ * It contains no application logic.
+ * It does not know what "increment" means.
+ * It does not know what your application does.
+ *
+ * Its only purpose is:
+ *
+ *     event
+ *       ↓
+ *     send HTML + event
+ *       ↓
+ *     receive HTML
+ *       ↓
+ *     replace document
+ *
+ * =========================================================
+ */
 
-function injectClientRuntime(html) {
+function injectRuntime(html) {
 
     const runtime = `
-
 <script>
 (() => {
 
-    /*
-     * This is the ONLY application-related JavaScript
-     * the browser receives.
-     *
-     * It does not contain the application's logic.
-     */
+    document.addEventListener("click", async (event) => {
 
+        const target =
+            event.target.closest("[id]");
 
-    async function sendAction(action) {
-
-        /*
-         * Capture the current state of the page.
-         */
-
-        const currentHTML =
-            document.documentElement.outerHTML;
+        if (!target)
+            return;
 
 
         const response =
@@ -222,9 +289,17 @@ function injectClientRuntime(html) {
 
                 body: JSON.stringify({
 
-                    html: currentHTML,
+                    html:
+                        document.documentElement
+                            .outerHTML,
 
-                    action: action
+                    action: {
+
+                        type: "click",
+
+                        target: target.id
+
+                    }
 
                 })
 
@@ -234,7 +309,6 @@ function injectClientRuntime(html) {
         if (!response.ok) {
 
             console.error(
-                "Frontend Worker error:",
                 await response.text()
             );
 
@@ -246,117 +320,95 @@ function injectClientRuntime(html) {
             await response.json();
 
 
-        if (!result.html) {
-            return;
-        }
-
-
-        /*
-         * Replace the current document with
-         * the Worker-generated document.
-         */
-
         document.open();
 
         document.write(result.html);
 
         document.close();
 
-    }
-
-
-    /*
-     * Capture clicks.
-     */
-
-    document.addEventListener(
-        "click",
-        event => {
-
-            const element =
-                event.target.closest("[id]");
-
-
-            if (!element) {
-                return;
-            }
-
-
-            sendAction({
-
-                type: "click",
-
-                id: element.id
-
-            });
-
-        }
-    );
+    });
 
 })();
 </script>
-
 `;
 
 
     /*
-     * Insert the runtime immediately before
-     * </body>.
+     * Put it immediately before </body>.
      */
 
-    if (html.includes("</body>")) {
+    if (/<\/body>/i.test(html)) {
 
         return html.replace(
             /<\/body>/i,
             runtime + "</body>"
         );
-
     }
 
-
-    /*
-     * Handle HTML documents without <body>.
-     */
 
     return html + runtime;
 }
 
 
-/* =========================================================
-   APPLICATION EXECUTION
-   ========================================================= */
+/*
+ * =========================================================
+ * EXECUTE APPLICATION
+ * =========================================================
+ */
 
-async function handleEvent(html, action) {
+async function executeApplication(
+    scripts,
+    html,
+    action
+) {
 
     /*
-     * THIS is where the secret frontend runtime
-     * will eventually execute the original JS.
+     * -----------------------------------------------------
+     * THIS IS CURRENTLY THE PLACEHOLDER.
+     * -----------------------------------------------------
      *
-     * For this first version, we're demonstrating
-     * the communication architecture.
+     * The next layer is our server-side DOM:
+     *
+     *     document
+     *     Element
+     *     Node
+     *     querySelector()
+     *     getElementById()
+     *     textContent
+     *     innerHTML
+     *     classList
+     *     appendChild()
+     *     remove()
+     *     etc.
+     *
+     * Then the extracted script is executed against
+     * that environment.
      */
 
 
     if (
         action.type === "click" &&
-        action.id === "increment"
+        action.target === "increment"
     ) {
 
-        html = incrementCounter(html);
-
+        html =
+            incrementCounter(html);
     }
 
 
     if (
         action.type === "click" &&
-        action.id === "change"
+        action.target === "change"
     ) {
 
-        html = html.replace(
-            /<p id="message">[\s\S]*?<\/p>/i,
-            `<p id="message">Changed by the Worker.</p>`
-        );
+        html =
+            html.replace(
+                /<p id="message">[\s\S]*?<\/p>/i,
 
+                `<p id="message">
+                    The secret frontend JS ran.
+                </p>`
+            );
     }
 
 
@@ -364,9 +416,11 @@ async function handleEvent(html, action) {
 }
 
 
-/* =========================================================
-   DEMO DOM MANIPULATION
-   ========================================================= */
+/*
+ * =========================================================
+ * DEMO DOM CHANGE
+ * =========================================================
+ */
 
 function incrementCounter(html) {
 
@@ -376,9 +430,8 @@ function incrementCounter(html) {
         );
 
 
-    if (!match) {
+    if (!match)
         return html;
-    }
 
 
     const count =
@@ -389,5 +442,67 @@ function incrementCounter(html) {
         match[0],
 
         `<p id="counter">Count: ${count}</p>`
+    );
+}
+
+
+/*
+ * =========================================================
+ * SESSION
+ * =========================================================
+ */
+
+function getSession(request) {
+
+    /*
+     * Temporary prototype session identifier.
+     *
+     * A production implementation should establish
+     * a real session cookie and persist state with a
+     * Durable Object.
+     */
+
+    const cookie =
+        request.headers.get("Cookie");
+
+
+    if (cookie) {
+
+        const match =
+            cookie.match(
+                /secret_session=([^;]+)/
+            );
+
+
+        if (match) {
+            return match[1];
+        }
+    }
+
+
+    /*
+     * Prototype fallback.
+     */
+
+    return "prototype";
+}
+
+
+/*
+ * =========================================================
+ * RESPONSE
+ * =========================================================
+ */
+
+function htmlResponse(html) {
+
+    return new Response(
+        html,
+        {
+            headers: {
+                "Content-Type":
+                    "text/html; charset=UTF-8"
+            }
+        }
     );
 }
