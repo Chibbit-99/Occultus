@@ -1,3 +1,22 @@
+/*
+|--------------------------------------------------------------------------
+| Occultus — Secret Frontend prototype (Cloudflare Worker)
+|--------------------------------------------------------------------------
+|
+| The whole application runs on the Worker. The browser receives only a
+| tiny communication runtime, never the application's JavaScript.
+|
+| This version ships a small server-side DOM engine. The application
+| script from source.html is executed inside the Worker against a
+| lightweight DOM implementation, so any of its behaviour — elements,
+| listeners, state, DOM writes — behaves like a normal page.
+|
+| Per-client application state lives in memory, keyed by a session id
+| the browser generates. A production build would back this with a
+| Durable Object so state survives Worker restarts.
+|
+*/
+
 export default {
     async fetch(request, env) {
         const url = new URL(request.url);
@@ -27,6 +46,42 @@ export default {
         });
     }
 };
+
+
+/*
+|--------------------------------------------------------------------------
+| Sessions
+|--------------------------------------------------------------------------
+|
+| Each browser tab gets its own execution context, so the application's
+| JavaScript state (e.g. the `count` variable) is isolated per client.
+|
+| This is an in-memory Map: the Worker is stateless across restarts, so
+| this is a demo-grade store. The README notes that a Durable Object is
+| the intended durable replacement.
+|
+*/
+
+const sessions = new Map();
+const MAX_SESSIONS = 256;
+
+function getSession(sessionId, html, scripts) {
+    const id = typeof sessionId === "string" ? sessionId : "default";
+
+    let session = sessions.get(id);
+
+    if (!session) {
+        session = createSession(html, scripts);
+        sessions.set(id, session);
+
+        // Keep the map bounded.
+        while (sessions.size > MAX_SESSIONS) {
+            sessions.delete(sessions.keys().next().value);
+        }
+    }
+
+    return session;
+}
 
 
 /*
@@ -71,13 +126,15 @@ async function serveApplication(env) {
 |
 | {
 |     html: "<!DOCTYPE html>...",
+|     sessionId: "s_...",
 |     action: {
 |         type: "click",
 |         target: "increment"
 |     }
 | }
 |
-| `html` is ALWAYS the browser's current state.
+| `html` is ALWAYS the browser's current state, but it is not used for
+| state here: the server-side DOM tree is authoritative for the session.
 |
 */
 
@@ -88,12 +145,8 @@ async function handleEvent(request, env) {
         data = await request.json();
     } catch {
         return Response.json(
-            {
-                error: "Invalid JSON."
-            },
-            {
-                status: 400
-            }
+            { error: "Invalid JSON." },
+            { status: 400 }
         );
     }
 
@@ -103,55 +156,38 @@ async function handleEvent(request, env) {
         typeof data.action !== "object"
     ) {
         return Response.json(
-            {
-                error: "Missing html or action."
-            },
-            {
-                status: 400
-            }
+            { error: "Missing html or action." },
+            { status: 400 }
         );
     }
 
-    /*
-     * Load the original source ONLY to obtain the
-     * application's secret JavaScript.
-     *
-     * The source HTML itself is NOT used as the
-     * current DOM state.
-     */
     const source = await getSource(env);
 
     if (!source) {
         return Response.json(
-            {
-                error: "Application source unavailable."
-            },
-            {
-                status: 500
-            }
+            { error: "Application source unavailable." },
+            { status: 500 }
         );
     }
 
     const applicationScripts = extractApplicationScripts(source);
 
-    /*
-     * Transform the HTML that the browser actually sent.
-     */
-    let updatedHTML = await executeApplication(
+    // Obtain (or create) the client's server-side execution context.
+    const session = getSession(
+        data.sessionId,
         data.html,
-        data.action,
         applicationScripts
     );
 
-    /*
-     * Absolutely no application JavaScript is allowed
-     * to reach the browser.
-     */
+    // Run the action against the server-side DOM.
+    applyAction(session, data.action);
+
+    let updatedHTML = serialize(session.dom.root);
+
+    // Absolutely no application JavaScript is allowed to reach the browser.
     updatedHTML = removeApplicationScripts(updatedHTML);
 
-    /*
-     * Add the ONLY JavaScript the browser receives.
-     */
+    // Add the ONLY JavaScript the browser receives.
     updatedHTML = injectRuntime(updatedHTML);
 
     return Response.json({
@@ -185,10 +221,6 @@ async function getSource(env) {
 |--------------------------------------------------------------------------
 | Extract application JavaScript
 |--------------------------------------------------------------------------
-|
-| This is currently kept separate so the next step can execute
-| these scripts inside a server-side DOM environment.
-|
 */
 
 function extractApplicationScripts(html) {
@@ -226,26 +258,294 @@ function removeApplicationScripts(html) {
 
 /*
 |--------------------------------------------------------------------------
+| Server-side DOM
+|--------------------------------------------------------------------------
+|
+| A deliberately small DOM engine, sized to run the application script
+| from source.html (elements, attributes, textContent, addEventListener).
+|
+| It is intentionally tiny and not a full browser DOM: it implements only
+| what a typical application script needs. The key point is that the
+| application's JS actually executes here, instead of being faked by
+| hand-written HTML string surgery.
+|
+*/
+
+const VOID_ELEMENTS = new Set([
+    "area", "base", "br", "col", "embed", "hr", "img",
+    "input", "link", "meta", "param", "source", "track", "wbr"
+]);
+
+function parseHTML(html) {
+    const root = {
+        tag: "#root",
+        attrs: {},
+        children: [],
+        parent: null
+    };
+
+    const stack = [root];
+    const n = html.length;
+    let i = 0;
+
+    while (i < n) {
+        const ch = html[i];
+
+        // Text up to the next tag.
+        if (ch !== "<") {
+            let j = html.indexOf("<", i);
+            if (j < 0) j = n;
+
+            const text = html.slice(i, j);
+            if (text) stack[stack.length - 1].children.push(text);
+
+            i = j;
+            continue;
+        }
+
+        // Comment.
+        if (html.startsWith("<!--", i)) {
+            let e = html.indexOf("-->", i + 4);
+            if (e < 0) e = n;
+            i = e + 3;
+            continue;
+        }
+
+        // Doctype / declarations.
+        if (html.startsWith("<!", i)) {
+            const m = html.slice(i).match(/^<![^>]*>/);
+            i += m ? m[0].length : 1;
+            continue;
+        }
+
+        // Processing instructions.
+        if (html.startsWith("<?", i)) {
+            const m = html.slice(i).match(/^<\?[^>]*\?>/);
+            i += m ? m[0].length : 1;
+            continue;
+        }
+
+        // Closing tag.
+        if (html.startsWith("</", i)) {
+            const m = html.slice(i).match(
+                /^<\/\s*([a-zA-Z][a-zA-Z0-9-]*)\s*>/
+            );
+            if (m) {
+                const tag = m[1].toLowerCase();
+                while (
+                    stack.length > 1 &&
+                    stack[stack.length - 1].tag !== tag
+                ) {
+                    stack.pop();
+                }
+                if (stack.length > 1) stack.pop();
+                i += m[0].length;
+            } else {
+                i++;
+            }
+            continue;
+        }
+
+        // Opening tag.
+        const m = html.slice(i).match(
+            /^<([a-zA-Z][a-zA-Z0-9-]*)((?:\s+[^<>]*?)?)(\/?)>/
+        );
+        if (!m) {
+            i++;
+            continue;
+        }
+
+        const tag = m[1].toLowerCase();
+        const attrs = parseAttrs(m[2]);
+        const selfClose = !!m[3];
+
+        const parent = stack[stack.length - 1];
+        const el = { tag, attrs, children: [], parent };
+
+        parent.children.push(el);
+        i += m[0].length;
+
+        if (selfClose || VOID_ELEMENTS.has(tag)) {
+            continue;
+        }
+
+        stack.push(el);
+
+        // Script and style bodies are raw text until their closing tag.
+        if (tag === "script" || tag === "style") {
+            const close = "</" + tag;
+            const e = html.toLowerCase().indexOf(close, i);
+            const end = e < 0 ? n : e;
+
+            el.children.push(html.slice(i, end));
+            i = e < 0 ? n : e + close.length;
+            stack.pop();
+        }
+    }
+
+    return root;
+}
+
+function parseAttrs(str) {
+    const attrs = {};
+    const re =
+        /([a-zA-Z_:][-a-zA-Z0-9_:.]*)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?/g;
+
+    let m;
+    while ((m = re.exec(str)) !== null) {
+        attrs[m[1]] = m[2] ?? m[3] ?? m[4] ?? "";
+    }
+
+    return attrs;
+}
+
+function isVoid(tag) {
+    return VOID_ELEMENTS.has(tag);
+}
+
+function findByID(node, id) {
+    if (node.attrs && node.attrs.id === id) return node;
+
+    for (const child of node.children) {
+        if (typeof child === "string") continue;
+        const found = findByID(child, id);
+        if (found) return found;
+    }
+
+    return null;
+}
+
+function collectText(node) {
+    if (typeof node === "string") return node;
+    return node.children.map(collectText).join("");
+}
+
+function serialize(node) {
+    if (typeof node === "string") return node;
+
+    if (node.tag === "#root") {
+        return node.children.map(serialize).join("");
+    }
+
+    const attrStr = Object.entries(node.attrs)
+        .map(([k, v]) => (v === "" ? k : `${k}="${v}"`))
+        .join(" ");
+
+    const open = `<${node.tag}${attrStr ? " " + attrStr : ""}>`;
+
+    if (isVoid(node.tag)) {
+        return open;
+    }
+
+    return open + node.children.map(serialize).join("") + `</${node.tag}>`;
+}
+
+/*
+| Add the DOM element API to a parsed node. Nodes are plain objects from
+| the parser; we attach methods/properties lazily so handlers registered
+| by the application script keep working across the session's lifetime.
+*/
+function ensureElementAPI(node) {
+    if (node.__api) return node;
+    node.__api = true;
+
+    node._handlers = {};
+
+    Object.defineProperty(node, "id", {
+        get() { return this.attrs.id ?? ""; },
+        configurable: true
+    });
+
+    Object.defineProperty(node, "textContent", {
+        get() { return collectText(this); },
+        set(value) { this.children = [String(value)]; },
+        configurable: true
+    });
+
+    Object.defineProperty(node, "outerHTML", {
+        get() { return serialize(this); },
+        configurable: true
+    });
+
+    node.addEventListener = function (type, fn) {
+        (this._handlers[type] ||= []).push(fn);
+    };
+
+    node.dispatchEvent = function (event) {
+        event.target = this;
+        const handlers = this._handlers[event.type] || [];
+        for (const fn of handlers) {
+            fn(event);
+        }
+    };
+
+    return node;
+}
+
+function createDocument(dom) {
+    return {
+        getElementById(id) {
+            const found = dom.root ? findByID(dom.root, id) : null;
+            return found ? ensureElementAPI(found) : null;
+        },
+        addEventListener() {
+            // Reserved for future document-level listeners.
+        },
+        createElement() {
+            throw new Error("createElement is not supported by the server DOM");
+        }
+    };
+}
+
+
+/*
+|--------------------------------------------------------------------------
+| Execute application
+|--------------------------------------------------------------------------
+|
+| The application script runs once per session, inside a fresh server-side
+| DOM. Its closures (variables like `count`, and registered listeners) live
+| for the whole session, so state persists between events exactly as it
+| would on a normal page.
+|
+*/
+
+function createSession(html, scripts) {
+    const dom = { root: parseHTML(html) };
+    const document = createDocument(dom);
+
+    const code = scripts.map(s => s.code).join("\n");
+
+    const fn = new Function("document", "window", "self", "globalThis", code);
+    fn(document, {}, {}, {});
+
+    return { dom, document };
+}
+
+function applyAction(session, action) {
+    if (!action || typeof action.target !== "string") return;
+
+    const el = session.document.getElementById(action.target);
+
+    if (el && typeof el.dispatchEvent === "function") {
+        el.dispatchEvent({ type: action.type || "click" });
+    }
+}
+
+
+/*
+|--------------------------------------------------------------------------
 | Browser communication runtime
 |--------------------------------------------------------------------------
 |
 | This is the ONLY JavaScript that gets sent to the browser.
 |
-| It does NOT contain application logic.
+| It does NOT contain application logic. Its only job is to send the
+| current DOM plus the user's action to the Worker, and to replace the
+| DOM with the transformed HTML the Worker returns.
 |
-| Its only job is:
-|
-|   browser DOM
-|       ↓
-|   current HTML
-|       +
-|   user action
-|       ↓
-|   Worker
-|       ↓
-|   transformed HTML
-|       ↓
-|   browser DOM
+| It also mints a stable session id (kept in sessionStorage) so the
+| Worker can keep per-client application state.
 |
 */
 
@@ -253,22 +553,39 @@ function injectRuntime(html) {
     const runtime = `
 <script>
 (() => {
+    let sessionId;
+
+    try {
+        sessionId = sessionStorage.getItem("__occultus_sid");
+    } catch (e) {
+        sessionId = null;
+    }
+
+    if (!sessionId) {
+        sessionId =
+            "s_" + Date.now().toString(36) + Math.random().toString(36).slice(2);
+
+        try {
+            sessionStorage.setItem("__occultus_sid", sessionId);
+        } catch (e) {
+            // Ignore storage failures; the id still lives for this page.
+        }
+    }
+
     async function send(action) {
         try {
-            const currentHTML =
-                document.documentElement.outerHTML;
+            const currentHTML = document.documentElement.outerHTML;
 
             const response = await fetch(
                 "/__occultus_event",
                 {
                     method: "POST",
-
                     headers: {
                         "Content-Type": "application/json"
                     },
-
                     body: JSON.stringify({
                         html: currentHTML,
+                        sessionId: sessionId,
                         action: action
                     })
                 }
@@ -279,7 +596,6 @@ function injectRuntime(html) {
                     "Occultus request failed:",
                     await response.text()
                 );
-
                 return;
             }
 
@@ -289,34 +605,22 @@ function injectRuntime(html) {
                 return;
             }
 
-            /*
-             * Replace the entire DOM with the state
-             * returned by the Worker.
-             */
+            // Replace the entire DOM with the Worker's state.
             document.open();
             document.write(result.html);
             document.close();
 
         } catch (error) {
-            console.error(
-                "Occultus communication error:",
-                error
-            );
+            console.error("Occultus communication error:", error);
         }
     }
 
-
-    /*
-     * Generic event detection.
-     *
-     * The application itself does not need to contain
-     * browser-side event listeners.
-     */
+    // Generic event detection. The application itself needs no browser
+    // side event listeners.
     document.addEventListener(
         "click",
         event => {
-            const element =
-                event.target.closest("[id]");
+            const element = event.target.closest("[id]");
 
             if (!element) {
                 return;
@@ -345,119 +649,6 @@ function injectRuntime(html) {
 
 /*
 |--------------------------------------------------------------------------
-| Execute application
-|--------------------------------------------------------------------------
-|
-| IMPORTANT:
-|
-| `html` is the CURRENT browser state.
-|
-| The Worker does NOT recreate the page.
-| It transforms the HTML it received.
-|
-| `applicationScripts` contains the secret JS from
-| source.html and will eventually be executed against
-| a server-side DOM implementation.
-|
-*/
-
-async function executeApplication(
-    html,
-    action,
-    applicationScripts
-) {
-    /*
-     * Temporary execution layer.
-     *
-     * This section demonstrates the intended behaviour
-     * until the actual server-side JavaScript/DOM runtime
-     * is implemented.
-     *
-     * Notice that every modification starts with `html`,
-     * which came directly from the browser.
-     */
-
-    if (
-        action.type === "click" &&
-        action.target === "increment"
-    ) {
-        html = incrementCounter(html);
-    }
-
-    if (
-        action.type === "click" &&
-        action.target === "change"
-    ) {
-        html = changeMessage(html);
-    }
-
-    return html;
-}
-
-
-/*
-|--------------------------------------------------------------------------
-| Increment
-|--------------------------------------------------------------------------
-|
-| Reads the CURRENT counter from the HTML.
-|
-| 0 → 1
-| 1 → 2
-| 2 → 3
-| ...
-|
-*/
-
-function incrementCounter(html) {
-    const counterRegex =
-        /(<p\b[^>]*\bid=["']counter["'][^>]*>)[\s\S]*?(\d+)([\s\S]*?<\/p>)/i;
-
-    const match = html.match(counterRegex);
-
-    if (!match) {
-        return html;
-    }
-
-    const currentCount =
-        Number(match[2]);
-
-    const newCount =
-        currentCount + 1;
-
-    html = html.replace(
-        match[0],
-        `${match[1]}Count: ${newCount}${match[3]}`
-    );
-
-    /*
-     * Update the message using the SAME new state.
-     */
-    html = html.replace(
-        /(<p\b[^>]*\bid=["']message["'][^>]*>)[\s\S]*?(<\/p>)/i,
-        `$1Clicked ${newCount} times.$2`
-    );
-
-    return html;
-}
-
-
-/*
-|--------------------------------------------------------------------------
-| Change message
-|--------------------------------------------------------------------------
-*/
-
-function changeMessage(html) {
-    return html.replace(
-        /(<p\b[^>]*\bid=["']message["'][^>]*>)[\s\S]*?(<\/p>)/i,
-        `$1This was changed by secret JS.$2`
-    );
-}
-
-
-/*
-|--------------------------------------------------------------------------
 | HTML response
 |--------------------------------------------------------------------------
 */
@@ -467,14 +658,26 @@ function htmlResponse(html) {
         html,
         {
             status: 200,
-
             headers: {
-                "Content-Type":
-                    "text/html; charset=UTF-8",
-
-                "Cache-Control":
-                    "no-store"
+                "Content-Type": "text/html; charset=UTF-8",
+                "Cache-Control": "no-store"
             }
         }
     );
 }
+
+
+/*
+|--------------------------------------------------------------------------
+| Exports (also used by the test harness)
+|--------------------------------------------------------------------------
+*/
+
+export {
+    parseHTML,
+    serialize,
+    createSession,
+    applyAction,
+    extractApplicationScripts,
+    removeApplicationScripts
+};

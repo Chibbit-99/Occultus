@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html>
+<body>
+    <p id="counter">Count: 0</p>
+    <p id="other">Other: 0</p>
+    <button id="go">Go</button>
+    <button id="reset">Reset</button>
+    <script>
+        let count = 0;
+        let other = 0;
+
+        document.getElementById("go").addEventListener("click", () => {
+            count += 5;
+            other += 1;
+            document.getElementById("counter").textContent = `Count: ${count}`;
+            document.getElementById("other").textContent = `Other: ${other}`;
+        });
+
+        document.getElementById("reset").addEventListener("click", () => {
+            count = 0;
+            other = 0;
+            document.getElementById("counter").textContent = `Count: ${count}`;
+            document.getElementById("other").textContent = `Other: ${other}`;
+        });
+    </script>
+</body>
+</html>
