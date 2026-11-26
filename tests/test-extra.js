@@ -1,8 +1,11 @@
 import { readFileSync } from "node:fs";
 
-import { createSession, applyAction, serialize } from "./worker.js";
+import { createSession, applyAction, serialize } from "../worker.js";
 
-const source = readFileSync("./test-extra.html", "utf8");
+const source = readFileSync(
+    new URL("./test-extra.html", import.meta.url),
+    "utf8"
+);
 
 const scripts = [...source.matchAll(/<script>([\s\S]*?)<\/script>/g)]
     .map(m => ({ attributes: "", code: m[1] }));

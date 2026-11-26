@@ -34,6 +34,11 @@ export default {
             return handleEvent(request, env);
         }
 
+        // Resources referenced by source.html (images, stylesheets...)
+        if (url.pathname.startsWith(RESOURCE_PREFIX)) {
+            return serveResource(env, url.pathname);
+        }
+
         // Never expose the original source file
         if (url.pathname === "/source.html") {
             return new Response("Not found", {
@@ -111,6 +116,9 @@ async function serveApplication(env) {
 
     let html = removeApplicationScripts(source);
 
+    // Point images/stylesheets at the Worker's resource route.
+    html = rewriteResourceURLs(html);
+
     html = injectRuntime(html);
 
     return htmlResponse(html);
@@ -170,7 +178,7 @@ async function handleEvent(request, env) {
         );
     }
 
-    const applicationScripts = extractApplicationScripts(source);
+    const applicationScripts = await loadApplicationScripts(source, env);
 
     // Obtain (or create) the client's server-side execution context.
     const session = getSession(
@@ -186,6 +194,9 @@ async function handleEvent(request, env) {
 
     // Absolutely no application JavaScript is allowed to reach the browser.
     updatedHTML = removeApplicationScripts(updatedHTML);
+
+    // Keep resource URLs on the Worker route after re-rendering.
+    updatedHTML = rewriteResourceURLs(updatedHTML);
 
     // Add the ONLY JavaScript the browser receives.
     updatedHTML = injectRuntime(updatedHTML);
@@ -214,6 +225,253 @@ async function getSource(env) {
     }
 
     return await response.text();
+}
+
+
+/*
+|--------------------------------------------------------------------------
+| Resources (images, stylesheets, other static files)
+|--------------------------------------------------------------------------
+|
+| source.html can reference files next to it:
+|
+|   <link rel="stylesheet" href="assets/app.css">
+|   <img src="assets/logo.svg">
+|   <script src="assets/app.js"></script>
+|
+| Stylesheets and images are proxied through the Worker under
+| RESOURCE_PREFIX, so the browser never needs direct access to the
+| project folder. JavaScript files are NOT proxied: they are application
+| code, so they are loaded by the Worker and executed server-side
+| (see loadApplicationScripts).
+|
+*/
+
+const RESOURCE_PREFIX = "/__occultus_resource/";
+
+// Files that must never be handed to the browser as a resource.
+const SECRET_FILE = /(?:^|\/)(?:source\.html?)$|\.(?:m?js|html?)$/i;
+
+// Point local resource URLs at the Worker's resource route.
+function rewriteResourceURLs(html) {
+    return html.replace(
+        /<([a-zA-Z][a-zA-Z0-9-]*)((?:[^<>"']|"[^"]*"|'[^']*')*)>/g,
+        (full, tagName, attrs) => {
+            const tag = tagName.toLowerCase();
+
+            // Only <link> uses href for resources; <a href> is navigation.
+            const names = tag === "link" ? ["src", "href"] : ["src", "poster"];
+
+            const rewritten = attrs.replace(
+                /(\s)(src|href|poster)(\s*=\s*)(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))/gi,
+                (match, space, name, equals, dq, sq, uq) => {
+                    if (!names.includes(name.toLowerCase())) return match;
+
+                    const value = dq ?? sq ?? uq ?? "";
+                    const next = resourceURL(value);
+
+                    if (next === value) return match;
+
+                    const quote = dq !== undefined ? '"' : sq !== undefined ? "'" : "";
+                    return `${space}${name}${equals}${quote}${next}${quote}`;
+                }
+            );
+
+            return `<${tagName}${rewritten}>`;
+        }
+    );
+}
+
+function resourceURL(value) {
+    const url = value.trim();
+
+    if (!url) return value;
+
+    // Anchors, data/blob URLs, and absolute URLs are left untouched.
+    if (url.startsWith("#")) return value;
+    if (/^(?:[a-z][a-z0-9+.-]*:|\/\/)/i.test(url)) return value;
+
+    // Already routed through the Worker.
+    if (url.startsWith(RESOURCE_PREFIX)) return value;
+
+    // Keep any query string or fragment after the rewritten path.
+    const split = url.search(/[?#]/);
+    const suffix = split < 0 ? "" : url.slice(split);
+    const path = normalizeResourcePath(split < 0 ? url : url.slice(0, split));
+
+    // Escaping paths are left alone; the Worker will answer 404.
+    if (!path) return value;
+
+    return RESOURCE_PREFIX + path + suffix;
+}
+
+// Resolve a local URL to a project-relative path. Returns "" for an empty
+// path and null when the path climbs out of the project root.
+function normalizeResourcePath(path) {
+    const parts = [];
+
+    for (const part of path.trim().replace(/\\/g, "/").split("/")) {
+        if (!part || part === ".") continue;
+
+        if (part === "..") {
+            if (parts.length === 0) return null;
+            parts.pop();
+            continue;
+        }
+
+        parts.push(part);
+    }
+
+    return parts.join("/");
+}
+
+async function serveResource(env, pathname) {
+    let path;
+
+    try {
+        path = decodeURIComponent(
+            pathname.slice(RESOURCE_PREFIX.length)
+        );
+    } catch {
+        return notFound();
+    }
+
+    path = normalizeResourcePath(path.split(/[?#]/)[0]);
+
+    if (!path) {
+        return notFound();
+    }
+
+    // Application code and the source document stay on the Worker.
+    if (SECRET_FILE.test(path)) {
+        return notFound();
+    }
+
+    let response;
+
+    try {
+        response = await env.ASSETS.fetch(
+            new Request("https://occultus.internal/" + path)
+        );
+    } catch {
+        return notFound();
+    }
+
+    if (!response.ok) {
+        return notFound();
+    }
+
+    const headers = new Headers();
+
+    headers.set(
+        "Content-Type",
+        response.headers.get("Content-Type") || contentTypeFor(path)
+    );
+    headers.set("Cache-Control", "public, max-age=3600");
+
+    return new Response(response.body, { status: 200, headers });
+}
+
+function contentTypeFor(path) {
+    const ext = path.slice(path.lastIndexOf(".") + 1).toLowerCase();
+
+    const types = {
+        css: "text/css; charset=UTF-8",
+        svg: "image/svg+xml",
+        png: "image/png",
+        jpg: "image/jpeg",
+        jpeg: "image/jpeg",
+        gif: "image/gif",
+        webp: "image/webp",
+        avif: "image/avif",
+        ico: "image/x-icon",
+        woff: "font/woff",
+        woff2: "font/woff2",
+        ttf: "font/ttf",
+        json: "application/json",
+        txt: "text/plain; charset=UTF-8"
+    };
+
+    return types[ext] || "application/octet-stream";
+}
+
+function notFound() {
+    return new Response("Not found", { status: 404 });
+}
+
+
+/*
+|--------------------------------------------------------------------------
+| Load application JavaScript (inline and <script src>)
+|--------------------------------------------------------------------------
+|
+| Scripts are executed by the Worker, never by the browser. A script that
+| lives in its own file is read from the assets binding, so it stays as
+| secret as an inline one.
+|
+*/
+
+async function loadApplicationScripts(html, env) {
+    const scripts = [];
+
+    const regex =
+        /<script\b([^>]*)>([\s\S]*?)<\/script\s*>/gi;
+
+    let match;
+
+    while ((match = regex.exec(html)) !== null) {
+        const attributes = match[1];
+        const code = match[2];
+        const src = getAttribute(attributes, "src");
+
+        if (!src) {
+            scripts.push({ attributes, code });
+            continue;
+        }
+
+        const path = localScriptPath(src);
+
+        // Remote scripts are not fetched: only the project's own code runs.
+        if (!path) continue;
+
+        let response;
+
+        try {
+            response = await env.ASSETS.fetch(
+                new Request("https://occultus.internal/" + path)
+            );
+        } catch {
+            continue;
+        }
+
+        if (!response.ok) continue;
+
+        scripts.push({ attributes, code: await response.text() });
+    }
+
+    return scripts;
+}
+
+function localScriptPath(src) {
+    const url = src.trim();
+
+    if (!url) return null;
+    if (/^(?:[a-z][a-z0-9+.-]*:|\/\/)/i.test(url)) return null;
+
+    const path = normalizeResourcePath(url.split(/[?#]/)[0]);
+
+    return path || null;
+}
+
+function getAttribute(attributes, name) {
+    const re = new RegExp(
+        `(?:^|\\s)${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s"'=<>\`]+))`,
+        "i"
+    );
+
+    const match = attributes.match(re);
+
+    return match ? (match[1] ?? match[2] ?? match[3] ?? "") : null;
 }
 
 
@@ -679,5 +937,9 @@ export {
     createSession,
     applyAction,
     extractApplicationScripts,
-    removeApplicationScripts
+    loadApplicationScripts,
+    removeApplicationScripts,
+    rewriteResourceURLs,
+    serveResource,
+    RESOURCE_PREFIX
 };

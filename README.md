@@ -10,8 +10,9 @@ the application's JavaScript.
   "secret" JavaScript as normal `<script>` blocks.
 - `worker.js` handles requests and application events:
 
-  1. On load, it reads `source.html`, strips the application scripts, and
-     injects a generic communication runtime into the page.
+1. On load, it reads `source.html`, strips the application scripts, routes
+   resource URLs through the Worker, and injects a generic communication
+   runtime into the page.
   2. When the browser reports an action, the Worker **runs the application
      script** against a built-in server-side DOM engine, then sends back the
      transformed HTML.
@@ -32,11 +33,34 @@ application's code on the Worker.
 
 | File | Role |
 |------|------|
-| `worker.js` | The Worker: routing, sessions, the server-side DOM engine, script extraction/removal, runtime injection, event handling. |
+| `worker.js` | The Worker: routing, sessions, the server-side DOM engine, script extraction/removal, resource proxying, runtime injection, event handling. |
 | `source.html` | The "real" application. Its `<script>` blocks are extracted and executed server-side. Never served to the browser. |
+| `assets/` | Resources referenced by `source.html`: `app.css` (stylesheet), `logo.svg` (image) and `app.js` (a second, external application script). |
 | `wrangler.toml` | Cloudflare Worker config (`name`, `main`, `ASSETS` binding, `run_worker_first`). |
-| `test.js` | Runs the original examples (increment, change) against the server DOM. |
-| `test-extra.html` / `test-extra.js` | Demonstrates that new functions (e.g. a second counter) work without Worker changes. |
+| `tests/test.js` | Runs the original examples (increment, change) against the server DOM. |
+| `tests/test-extra.html` / `tests/test-extra.js` | Demonstrates that new functions (e.g. a second counter) work without Worker changes. |
+| `tests/test-server.js` | Drives the Worker's request flow: initial load, resource serving, events, secrecy. |
+
+## Resources
+
+`source.html` can reference files next to it, just like a normal page:
+
+```html
+<link rel="stylesheet" href="assets/app.css">
+<img src="assets/logo.svg">
+<script src="assets/app.js"></script>
+```
+
+- **Images, stylesheets and other static files** are rewritten to
+  `/__occultus_resource/...` and proxied through the Worker, so the browser
+  never reads the project folder directly.
+- **`<script src="...">`** is application code: the Worker fetches the file
+  through the `ASSETS` binding and runs it server-side in the same scope as
+  the inline scripts. The browser never receives it.
+- `.js`, `.mjs`, `.html` and `source.html` are never handed out as resources,
+  and `..` path traversal is rejected.
+- Remote URLs (`https://...`, `data:`, `//...`) and `<a href>` navigation are
+  left untouched.
 
 ## Running
 
@@ -55,13 +79,16 @@ you should see is the injected runtime — the application script from
 The server-side DOM engine is validated without a browser:
 
 ```bash
-node test.js
-node test-extra.js
+node tests/test.js
+node tests/test-extra.js
+node tests/test-server.js
 ```
 
-`test.js` checks the two original interactions (increment, change) plus
-session isolation; `test-extra.js` adds functions the prototype never had
-(a second counter, a reset) and confirms they run untoched.
+`tests/test.js` checks the two original interactions (increment, change) plus
+session isolation; `tests/test-extra.js` adds functions the prototype never had
+(a second counter, a reset) and confirms they run untouched;
+`tests/test-server.js` exercises the full request flow, including resource
+serving, URL rewriting and secrecy.
 
 ## Known limitations / next steps
 

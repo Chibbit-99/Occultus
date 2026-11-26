@@ -6,30 +6,16 @@
 
     <title>Occultus</title>
 
-    <style>
-        body {
-            font-family: system-ui, sans-serif;
-            max-width: 700px;
-            margin: 80px auto;
-            padding: 20px;
-        }
-
-        button {
-            padding: 10px 16px;
-            margin: 5px;
-            border: 1px solid #aaa;
-            border-radius: 8px;
-            background: white;
-            cursor: pointer;
-        }
-
-        #counter {
-            font-size: 2rem;
-        }
-    </style>
+    <!--
+        Local resources are served through the Worker, so the browser
+        never reads the project folder directly.
+    -->
+    <link rel="stylesheet" href="assets/app.css">
 </head>
 
 <body>
+
+    <img class="logo" src="assets/logo.svg" alt="Occultus">
 
     <h1>Occultus</h1>
 
@@ -43,6 +29,10 @@
 
     <button id="change">
         Change message
+    </button>
+
+    <button id="reset">
+        Reset
     </button>
 
 
@@ -89,6 +79,13 @@
             });
 
     </script>
+
+
+    <!--
+        External application script. The Worker fetches it through the
+        assets binding and runs it server-side; the browser never sees it.
+    -->
+    <script src="assets/app.js"></script>
 
 </body>
 </html>

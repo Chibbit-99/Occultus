@@ -8,4 +8,7 @@ compatibility_date = "2026-09-25"
 directory = "."
 binding = "ASSETS"
 
-run_worker_first = ["/", "/source.html", "/__occultus_event"]
+# The Worker is the only entry point: it decides what reaches the browser
+# (the page, the injected runtime and the resources it proxies). Everything
+# else — source.html, application scripts, tests — stays private.
+run_worker_first = true

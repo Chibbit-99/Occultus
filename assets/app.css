@@ -1,0 +1,25 @@
+body {
+    font-family: system-ui, sans-serif;
+    max-width: 700px;
+    margin: 80px auto;
+    padding: 20px;
+}
+
+button {
+    padding: 10px 16px;
+    margin: 5px;
+    border: 1px solid #aaa;
+    border-radius: 8px;
+    background: white;
+    cursor: pointer;
+}
+
+#counter {
+    font-size: 2rem;
+}
+
+.logo {
+    display: block;
+    width: 48px;
+    height: 48px;
+}

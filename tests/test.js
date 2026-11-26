@@ -6,9 +6,12 @@ import {
     createSession,
     applyAction,
     extractApplicationScripts
-} from "./worker.js";
+} from "../worker.js";
 
-const source = readFileSync("./source.html", "utf8");
+const source = readFileSync(
+    new URL("../source.html", import.meta.url),
+    "utf8"
+);
 const scripts = extractApplicationScripts(source);
 
 console.log(`extracted ${scripts.length} script(s) from source.html`);
